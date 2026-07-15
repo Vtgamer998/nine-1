@@ -3,15 +3,20 @@ NINE-1: Transformer decoder-only minimal, implementado do zero usando PyTorch.
 Arquitetura:
 - Embeddings de tokens + positional encodings (learned)
 - N blocos: pre-norm Transformer
-  - Multi-head causal self-attention
+  - Multi-head causal self-attention com KV Cache opcional
   - MLP (Linear -> GELU -> Linear) com expansao 4x
 - Final: RMSNorm + Linear (tied weights com embedding)
+
+Features:
+- KV Cache para geracao O(n) em vez de O(n^2)
+- Suporte a FlashAttention (PyTorch >=2.0)
+- Inicializacao estavel
 """
 
 from __future__ import annotations
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -44,7 +49,7 @@ class RMSNorm(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    """Atencao causal multi-cabeca com projecao QKV."""
+    """Atencao causal multi-cabeca com projecao QKV e KV Cache."""
 
     def __init__(self, cfg: NINEConfig):
         super().__init__()
@@ -52,26 +57,54 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.n_embd = cfg.n_embd
         self.head_dim = cfg.n_embd // cfg.n_head
-        # Projecao combinada Q,K,V
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
-        # Projecao de saida
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.dropout = cfg.dropout
-        # Mascara causal: register_buffer para mover com o modelo
         mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool)).view(
             1, 1, cfg.block_size, cfg.block_size
         )
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor,
+                kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         B, T, C = x.size()
+
+        # Com KV Cache: so calculamos Q,K,V para o NOVO token
+        if kv_cache is not None:
+            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+            k_prev, v_prev = kv_cache
+            # Concatena com cache anterior
+            k = torch.cat([k_prev, k], dim=2)
+            v = torch.cat([v_prev, v], dim=2)
+
+            T_full = k.size(2)
+            if hasattr(F, "scaled_dot_product_attention"):
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
+            else:
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+                att = att.masked_fill(~self.mask[:, :, :T, :T_full], float("-inf"))
+                att = F.softmax(att, dim=-1)
+                y = att @ v
+
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            y = self.c_proj(y)
+            return y, (k, v)
+
+        # Sem KV Cache (training / batch)
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        # Reshape para (B, nh, T, hd)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # Atencao com Flash-like (PyTorch >=2.0 tem scaled_dot_product_attention)
         if hasattr(F, "scaled_dot_product_attention"):
             y = F.scaled_dot_product_attention(
                 q, k, v,
@@ -87,7 +120,7 @@ class CausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return y
+        return y, (k, v)
 
 
 class MLP(nn.Module):
@@ -110,33 +143,32 @@ class Block(nn.Module):
         self.ln_2 = RMSNorm(cfg.n_embd)
         self.mlp = MLP(cfg)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x: torch.Tensor,
+                kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        attn_out, new_kv = self.attn(self.ln_1(x), kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, new_kv
 
 
 class NINE1(nn.Module):
-    """Modelo NINE-1: decoder Transformer pequeno."""
+    """Modelo NINE-1: decoder Transformer pequeno com KV Cache."""
 
     def __init__(self, cfg: NINEConfig):
         super().__init__()
         self.cfg = cfg
 
         self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),  # token embedding
-            wpe=nn.Embedding(cfg.block_size, cfg.n_embd),   # positional
+            wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
+            wpe=nn.Embedding(cfg.block_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
             h=nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)]),
             ln_f=RMSNorm(cfg.n_embd),
         ))
-        # LM head (tied com embedding -> economiza parametros)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
-        # Inicializacao
         self.apply(self._init_weights)
-        # Pequeno scale na projecao de saida (mais estavel)
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
@@ -149,17 +181,22 @@ class NINE1(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
+                kv_caches: Optional[list] = None):
         B, T = idx.size()
         assert T <= self.cfg.block_size, f"contexto {T} > block_size {self.cfg.block_size}"
 
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        tok_emb = self.transformer.wte(idx)            # (B, T, C)
-        pos_emb = self.transformer.wpe(pos)             # (T, C)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
 
-        for block in self.transformer.h:
-            x = block(x)
+        new_kv_caches = [] if kv_caches is not None else None
+        for i, block in enumerate(self.transformer.h):
+            cache = kv_caches[i] if kv_caches is not None else None
+            x, new_kv = block(x, kv_cache=cache)
+            if new_kv_caches is not None:
+                new_kv_caches.append(new_kv)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -169,20 +206,27 @@ class NINE1(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
-            return logits, loss
+            return logits, loss, new_kv_caches
         else:
-            # Otimizacao: calcular logits apenas do ultimo token
             logits = self.lm_head(x[:, [-1], :])
-            return logits, None
+            return logits, None, new_kv_caches
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int = 100,
                  temperature: float = 1.0, top_k: Optional[int] = None,
-                 top_p: Optional[float] = None) -> torch.Tensor:
-        """Gera tokens um a um (com top-k e/ou nucleus sampling)."""
+                 top_p: Optional[float] = None,
+                 use_cache: bool = True) -> torch.Tensor:
+        """Gera tokens um a um com KV Cache opcional."""
+        kv_caches = None
+
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.cfg.block_size else idx[:, -self.cfg.block_size:]
-            logits, _ = self(idx_cond)
+            if use_cache and kv_caches is not None:
+                # So passa o ultimo token
+                idx_cond = idx[:, -1:]
+            else:
+                idx_cond = idx if idx.size(1) <= self.cfg.block_size else idx[:, -self.cfg.block_size:]
+
+            logits, _, kv_caches = self(idx_cond, kv_caches=kv_caches)
             logits = logits[:, -1, :] / max(temperature, 1e-6)
 
             if top_k is not None:
@@ -223,5 +267,11 @@ if __name__ == "__main__":
     print(f"Parametros: {m.num_params()/1e6:.2f}M")
     x = torch.randint(0, cfg.vocab_size, (2, 32))
     y = torch.randint(0, cfg.vocab_size, (2, 32))
-    logits, loss = m(x, y)
+    logits, loss, _ = m(x, y)
     print(f"logits: {logits.shape}, loss: {loss.item():.3f}")
+
+    # Teste KV Cache
+    m.eval()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 16))
+    out = m.generate(prompt, max_new_tokens=20, temperature=1.0, top_k=10, use_cache=True)
+    print(f"generate (cached): {out.shape}")

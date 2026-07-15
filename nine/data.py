@@ -1,40 +1,43 @@
 """
 Dataset loader para o NINE-1.
-Le arquivos de texto/codigo no formato binario (memmap) ou texto puro,
-e cria batches aleatorios de (input, target) com deslocamento de 1 token.
+Le arquivos de binario (memmap) ou texto puro, cria batches (input, target).
 """
 
 from __future__ import annotations
 import os
 import random
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 
 class TextDataset(Dataset):
     """
-    Memoria-map para arquivos binarios (.bin) gerados por prep_data.py,
-    ou fallback para texto puro.
+    Dataset sequencial deterministico sobre memmap .bin.
+    Cada index retorna um chunk de block_size+1 tokens consecutivos.
     """
 
-    def __init__(self, data_path: str, block_size: int, vocab_size: Optional[int] = None):
+    def __init__(self, data: Union[np.memmap, np.ndarray, str],
+                 block_size: int, vocab_size: Optional[int] = None):
         self.block_size = block_size
-        if data_path.endswith(".bin"):
-            self.data = np.memmap(data_path, dtype=np.uint16, mode="r")
+        if isinstance(data, str):
+            if data.endswith(".bin"):
+                self.data = np.memmap(data, dtype=np.uint16, mode="r")
+            else:
+                with open(data, "r", encoding="utf-8") as f:
+                    txt = f.read()
+                self.data = np.frombuffer(txt.encode("utf-8"), dtype=np.uint8).astype(np.int64)
         else:
-            with open(data_path, "r", encoding="utf-8") as f:
-                txt = f.read()
-            self.data = np.frombuffer(txt.encode("utf-8"), dtype=np.uint8).astype(np.int64)
-        self.length = len(self.data) - block_size - 1
+            self.data = data
+        self.length = max(0, len(self.data) - block_size - 1)
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        i = random.randint(0, max(0, self.length))
+        i = idx % self.length
         chunk = np.array(self.data[i : i + self.block_size + 1], dtype=np.int64)
         x = torch.from_numpy(chunk[:-1])
         y = torch.from_numpy(chunk[1:])

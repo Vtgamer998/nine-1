@@ -1,8 +1,8 @@
 """
 Script de pre-treinamento do NINE-1.
 Uso:
-    python -m nine.train --data nine/data/corpus.txt --out nine/data/nine1-base.pt
-    (ou use prep_data.py para tokenizar e salvar .bin)
+    python -m nine.train --data nine/data/corpus.bin --tok nine/data/nine1-tok.json
+                         --out nine/data/nine1-base.pt
 """
 
 from __future__ import annotations
@@ -15,13 +15,14 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
-from .model import NINE1, tiny_config, NINEConfig
+from .model import NINE1, NINEConfig
 from .data import get_batch
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, required=True, help="arquivo .bin ou .txt")
+    p.add_argument("--data", type=str, required=True, help="arquivo .bin ou .txt tokenizado")
+    p.add_argument("--tok", type=str, default=None, help="tokenizer BPE .json (opcional, para log)")
     p.add_argument("--out", type=str, default="nine/data/nine1-base.pt")
     p.add_argument("--vocab", type=int, default=4096)
     p.add_argument("--block_size", type=int, default=512)
@@ -34,6 +35,7 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=100)
     p.add_argument("--eval_interval", type=int, default=200)
     p.add_argument("--save_interval", type=int, default=500)
+    p.add_argument("--val_split", type=float, default=0.05, help="fracao para validacao")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_available() else "float32")
     p.add_argument("--seed", type=int, default=1337)
@@ -47,6 +49,18 @@ def get_lr(it: int, warmup: int, max_iters: int) -> float:
         return 0.1
     decay_ratio = (it - warmup) / (max_iters - warmup)
     return 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+
+@torch.no_grad()
+def estimate_loss(model, data, block_size, batch_size, device, num_batches=20):
+    model.eval()
+    losses = []
+    for _ in range(num_batches):
+        x, y = get_batch(data, block_size, batch_size, device)
+        _, loss = model(x, y)
+        losses.append(loss.item())
+    model.train()
+    return float(np.mean(losses))
 
 
 def main():
@@ -69,8 +83,10 @@ def main():
 
     # Split treino/val
     n = len(data)
-    train_data = data  # 100% treino aqui (corpus pequeno); val opcional
-    print(f"Tokens no dataset: {n}")
+    val_size = int(n * args.val_split)
+    train_data = data[val_size:]
+    val_data = data[:val_size] if val_size > 0 else None
+    print(f"Tokens no dataset: {n} (treino: {len(train_data)}, val: {val_size})")
 
     # Configuracao
     cfg = NINEConfig(
@@ -88,6 +104,12 @@ def main():
     n_params = model.num_params() / 1e6
     print(f"NINE-1 (base): {n_params:.2f}M parametros")
 
+    if args.tok:
+        print(f"Tokenizer BPE: {args.tok}")
+        from .tokenizer import BPETokenizer
+        tok = BPETokenizer.load(args.tok)
+        print(f"  vocab: {len(tok)} tokens")
+
     # Otimizador
     decay, no_decay = [], []
     for n_, p in model.named_parameters():
@@ -102,14 +124,14 @@ def main():
         lr=args.lr, betas=(0.9, 0.95),
     )
 
-    ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
+    ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16,
+               "float16": torch.float16}[args.dtype]
     ctx = torch.amp.autocast(args.device, dtype=ptdtype) if args.device == "cuda" else nullcontext()
 
     # Loop
     t0 = time.time()
-    losses = []
+    best_val_loss = float("inf")
     for it in range(args.max_iters):
-        # Ajusta LR
         lr = get_lr(it, args.warmup, args.max_iters) * args.lr
         for g in optim.param_groups:
             g["lr"] = lr
@@ -117,8 +139,6 @@ def main():
         with ctx:
             x, y = get_batch(train_data, args.block_size, args.batch_size, args.device)
             _, loss = model(x, y)
-            loss = loss / 1.0
-        losses.append(loss.item())
 
         optim.zero_grad(set_to_none=True)
         loss.backward()
@@ -129,6 +149,15 @@ def main():
             dt = (time.time() - t0) * 1000 / max(it + 1, 1)
             print(f"iter {it}/{args.max_iters} | lr {lr:.2e} | loss {loss.item():.3f} | {dt:.1f}ms/iter")
 
+        if it > 0 and it % args.eval_interval == 0 and val_data is not None:
+            val_loss = estimate_loss(model, val_data, args.block_size,
+                                     args.batch_size, args.device)
+            print(f"  >>> val loss: {val_loss:.3f} (best: {best_val_loss:.3f})")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, args.out)
+                print(f"  >>> melhor checkpoint salvo em {args.out}")
+
         if it > 0 and it % args.save_interval == 0:
             os.makedirs(os.path.dirname(args.out), exist_ok=True)
             torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, args.out)
@@ -138,6 +167,10 @@ def main():
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, args.out)
     print(f"\nTreino finalizado. Loss final: {loss.item():.3f}")
+    if val_data is not None:
+        final_val = estimate_loss(model, val_data, args.block_size,
+                                  args.batch_size, args.device)
+        print(f"Val loss final: {final_val:.3f}")
     print(f"Checkpoint: {args.out}")
 
 
