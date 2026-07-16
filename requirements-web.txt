@@ -1,6 +1,6 @@
 # NINE-1 Web UI - Dependencias adicionais
 gradio>=5.0.0,<7.0.0
-# Opcional: para exportacao SafeTensors -> GGUF
-safetensors>=0.4.0
-# Opcional: para DPO (fine-tuning com preferencias)
-datasets>=2.14.0
+
+# Opcional (instale manualmente se precisar):
+# safetensors - para exportacao de modelos (pip install safetensors)
+# datasets - para fine-tuning DPO (pip install datasets)

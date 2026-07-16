@@ -435,18 +435,17 @@ def convert_to_gguf(
 
     # AVISO sobre o formato custom
     print(f"[gguf] AVISO: Usando arquitetura custom '{ARCHITECTURE}'.")
-    print(f"[gguf] Para usar com llama.cpp, voce precisa:")
-    print(f"[gguf]   1. Exportar para SafeTensors primeiro:")
-    print(f"[gguf]      python -m nine.to_gguf {model_path} --out model")
-    print(f"[gguf]   2. Usar convert_hf_to_gguf.py do llama.cpp")
-    print(f"[gguf] Ou carregar este .gguf com cognee/gguf-parser")
+    print(f"[gguf] Para usar com llama.cpp, exporte para SafeTensors:")
+    print(f"[gguf]   python -m nine.to_gguf {model_path} --out model")
+    print(f"[gguf]   cd llama.cpp && python convert_hf_to_gguf.py ./model --outfile model.gguf")
 
     if quantize is None:
-        # Oferece exportacao SafeTensors como alternativa
+        # Modo padrao: exporta SafeTensors (recomendado)
         safetensors_path = output_path.replace(".gguf", ".safetensors")
         export_to_safetensors(state, metadata, safetensors_path, verbose)
         return
 
+    # Modo GGUF direto (experimental, requer suporte no llama.cpp)
     with open(output_path, "wb") as f:
         # --- HEADER ---
         f.write(struct.pack("<I", GGUF_MAGIC))
@@ -458,43 +457,35 @@ def convert_to_gguf(
         for key, value, gguf_type in metadata:
             _write_kv(f, key, value, gguf_type)
 
-        # Adiciona tokens do vocabulario como metadados
-    if tokenizer_data:
-        vocab_map = tokenizer_data.get("vocab", {})
-        token_list = []
-        for tid in sorted(int(k) for k in vocab_map.keys()):
-            token_list.append(vocab_map[str(tid)])
-        _write_kv(f, "tokenizer.ggml.model", "gpt2", GGUFType.STRING)
-        # Vocabulario como array de strings
-        f.write(b"tokenizer.ggml.tokens" + b"\x00" * (64 - 20))  # placeholder
-        # Simplificacao: escreve tokens sem o KV completo
-        # (idealmente usaria o script oficial do llama.cpp)
-        if verbose:
-            print(f"[gguf] Tokenizer tem {len(token_list)} tokens")
-        _write_kv(f, f"{ARCHITECTURE}.vocab_size", len(token_list), GGUFType.UINT32)
+        # Adiciona info do tokenizer (simplificado)
+        if tokenizer_data:
+            token_list = [
+                tokenizer_data["vocab"][str(tid)]
+                for tid in sorted(int(k) for k in tokenizer_data.get("vocab", {}).keys())
+            ]
+            _write_kv(f, "tokenizer.ggml.model", "gpt2", GGUFType.STRING)
+            if verbose:
+                print(f"[gguf] Tokenizer: {len(token_list)} tokens")
 
         # --- TENSOR INFO + DATA ---
         if verbose:
             print(f"[gguf] Escrevendo {n_tensors} tensores...")
 
-        # Primeiro, calcula posicoes (info + offset)
+        # Calcula info dos tensores
         tensor_info_offsets = []
         for name in tensor_names:
             mapped_name = _tensor_name_gguf(name, n_layer)
             tensor = state[name]
             shape = list(tensor.shape)
             n_elements = tensor.numel()
-            # GGUF usa shape reverso (fortran order)
             n_dims = len(shape)
 
-            # Calcula tamanho do tensor quantizado
+            # Calcula tamanho do tensor
             if tensor_type == GGUFTensorType.Q4_0:
-                block_size_q = 32
-                n_blocks = (n_elements + block_size_q - 1) // block_size_q
+                n_blocks = (n_elements + 31) // 32
                 data_size = n_blocks * 18
             elif tensor_type == GGUFTensorType.Q8_0:
-                block_size_q = 32
-                n_blocks = (n_elements + block_size_q - 1) // block_size_q
+                n_blocks = (n_elements + 31) // 32
                 data_size = n_blocks * 34
             elif tensor_type == GGUFTensorType.F16:
                 data_size = n_elements * 2
@@ -504,31 +495,27 @@ def convert_to_gguf(
             tensor_info_offsets.append((mapped_name, n_dims, shape, tensor_type, data_size))
 
         # Escreve info de cada tensor, rastreando posicoes dos offsets
-        offset_positions = []  # (file_pos_do_offset,)
-        for name, n_dims, shape, tt, data_size in tensor_info_offsets:
+        offset_positions = []
+        for name, n_dims, shape, tt, _ in tensor_info_offsets:
             _write_str(f, name)
             _write_uint32(f, n_dims)
             if n_dims == 1:
                 _write_uint64(f, shape[0])
             elif n_dims == 2:
-                _write_uint64(f, shape[1])  # rows
-                _write_uint64(f, shape[0])  # cols
+                _write_uint64(f, shape[1])
+                _write_uint64(f, shape[0])
             else:
                 _write_uint64(f, shape[0])
             _write_uint32(f, int(tt))
-            # Registra posicao do offset
             offset_positions.append(f.tell())
-            _write_uint64(f, 0)  # Placeholder
+            _write_uint64(f, 0)  # Placeholder offset
 
-        # Prepara dados e calcula offsets reais
-        tensor_data_list = []
-        current_offset = 0
         # Alinha ao comeco dos dados
-        aligned_data_start = f.tell()
         _write_padding(f, alignment)
-        aligned_start_pos = f.tell()
-        current_offset = 0
+        data_start = f.tell()
 
+        # Prepara e escreve dados
+        current_offset = 0
         for i, name in enumerate(tensor_names):
             tensor = state[name]
             if tensor_type == GGUFTensorType.Q4_0:
@@ -539,59 +526,25 @@ def convert_to_gguf(
                 data_bytes = tensor.detach().half().numpy().tobytes()
             else:
                 data_bytes = tensor.detach().float().numpy().tobytes()
-            tensor_data_list.append(data_bytes)
 
-        # Calcula offsets relativos ao inicio dos dados
-        real_offsets = []
-        current_offset = 0
-        for i, data_bytes in enumerate(tensor_data_list):
-            real_offsets.append(current_offset)
+            # Atualiza offset placeholder
+            f.seek(offset_positions[i])
+            _write_uint64(f, current_offset)
+
+            # Escreve dados
+            f.seek(data_start + current_offset)
+            f.write(data_bytes)
             current_offset += len(data_bytes)
             # Alinhamento
             current_offset = (current_offset + alignment - 1) // alignment * alignment
 
-        # Volta para escrever offsets corretos (cada um na sua posicao)
-        for pos, offset in zip(offset_positions, real_offsets):
-            f.seek(pos)
-            _write_uint64(f, offset)
-
-        # Volta ao final e escreve dados
-        f.seek(aligned_start_pos)
-        for i, data_bytes in enumerate(tensor_data_list):
-            f.write(data_bytes)
-            _write_padding(f, alignment)
-
-        # Escreve dados dos tensores
-        for i, name in enumerate(tensor_names):
-            tensor = state[name]
-            if verbose:
-                print(f"  [{i+1}/{n_tensors}] {name} -> {tensor.shape}")
-
-            offset = new_offsets[i]
-            f.seek(offset)
-
-            if tensor_type == GGUFTensorType.Q4_0:
-                data_bytes = _quantize_q4_0(tensor)
-            elif tensor_type == GGUFTensorType.Q8_0:
-                data_bytes = _quantize_q8_0(tensor)
-            elif tensor_type == GGUFTensorType.F16:
-                data_bytes = tensor.detach().half().numpy().tobytes()
-            else:
-                data_bytes = tensor.detach().float().numpy().tobytes()
-
-            f.write(data_bytes)
-            # Padding apos cada tensor
-            _write_padding(f, alignment)
-
-        # Fecha o arquivo
         file_size = f.tell()
 
     if verbose:
         size_mb = file_size / 1024 / 1024
         print(f"\n[gguf] Arquivo salvo: {output_path}")
         print(f"[gguf] Tamanho: {size_mb:.2f} MB")
-        print(f"[gguf] Formato: {'F16' if tensor_type == GGUFTensorType.F16 else str(tensor_type.name)}")
-        print(f"[gguf] Use llama.cpp: ./main -m {output_path} -p \"sei prompt\"")
+        print(f"[gguf] Formato: {tensor_type.name}")
 
 
 def parse_args():
