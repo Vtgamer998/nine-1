@@ -1,25 +1,36 @@
 #!/bin/bash
 # NINE-1 Web UI - Script de inicializacao
 # Uso: bash run_webui.sh [--share] [--port 7860]
+#
+# Nota: Requer torch + gradio instalados.
+# No Termux (Android), use o Google Colab em vez disso:
+#   https://colab.research.google.com/github/Vtgamer998/nine-1/blob/main/notebooks/train_nine1.ipynb
+
+set -e
+
+# Verifica dependencias criticas
+MISSING=""
+for mod in torch gradio; do
+    if ! python -c "import $mod" 2>/dev/null; then
+        MISSING="$MISSING $mod"
+    fi
+done
+
+if [ -n "$MISSING" ]; then
+    echo "[erro] Dependencias faltando:$MISSING"
+    echo ""
+    echo "Para rodar localmente (Linux/desktop):"
+    echo "  pip install torch numpy gradio"
+    echo ""
+    echo "Para rodar no Google Colab (recomendado no celular):"
+    echo "  Abra o notebook: notebooks/train_nine1.ipynb"
+    echo "  Ou: https://colab.research.google.com/github/Vtgamer998/nine-1/blob/main/notebooks/train_nine1.ipynb"
+    exit 1
+fi
 
 CKPT="nine/data/nine1-base.pt"
 TOK="nine/data/nine1-tok.json"
 LORA="nine/data/nine1-instruct.pt"
-
-# Verifica dependencias
-if ! python -c "import gradio" 2>/dev/null; then
-    echo "[setup] Instalando dependencias web (gradio)..."
-    pip install gradio 2>&1 || {
-        echo "[erro] Falha ao instalar gradio. Tente manualmente:"
-        echo "  pip install gradio"
-        exit 1
-    }
-fi
-
-# Verifica dependencias opcionais (falha silenciosa)
-if ! python -c "import safetensors" 2>/dev/null; then
-    echo "[info] safetensors nao instalado (opcional - necessario para exportacao GGUF)"
-fi
 
 # Verifica checkpoint
 if [ ! -f "$CKPT" ]; then
