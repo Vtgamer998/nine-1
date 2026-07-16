@@ -1,6 +1,12 @@
 """
 NINE-1 - IA de Programacao em PT-BR, construida do zero.
 
+v0.4.0 - GQA & CI & Documentacao
+  - GQA (Grouped Query Attention) para KV Cache 2-3x menor
+  - GitHub Actions CI com testes em Python 3.10-3.12
+  - Documentacao completa da arquitetura, API e seguranca
+  - Compatibilidade retroativa com checkpoints pre-GQA (c_attn)
+
 v0.3.0 - Seguranca & RoPE
   - RoPE (Rotary Position Embeddings) para melhor generalizacao posicional
   - Validacao de checkpoint com deteccao de NaN/Inf
@@ -20,5 +26,5 @@ v0.2.0:
   - Pipeline de tokenizacao unificado (BPE em treino + fine-tune)
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "NINE-1 project"

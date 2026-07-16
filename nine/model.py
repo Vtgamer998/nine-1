@@ -135,7 +135,8 @@ class NINEConfig:
     vocab_size: int = 512
     block_size: int = 256          # maximo de contexto (tokens)
     n_layer: int = 6               # blocos transformer
-    n_head: int = 6                # cabecas de atencao
+    n_head: int = 6                # cabecas de atencao (query)
+    n_kv_heads: int = 0           # cabecas K/V (0 = mesmo que n_head, MHA)
     n_embd: int = 384              # dimensao do embedding
     dropout: float = 0.0
     bias: bool = False             # sem bias em Linear (nanoGPT style)
@@ -235,11 +236,18 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
         self.n_head = cfg.n_head
+        self.n_kv_heads = cfg.n_kv_heads if cfg.n_kv_heads > 0 else cfg.n_head
         self.n_embd = cfg.n_embd
         self.head_dim = cfg.n_embd // cfg.n_head
         self.use_rope = cfg.use_rope
+        assert self.n_head % self.n_kv_heads == 0, "n_head deve ser multiplo de n_kv_heads"
+        self.n_rep = self.n_head // self.n_kv_heads  # repeticoes para GQA
 
-        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        # Projecoes separadas para Q (n_head) e K/V (n_kv_heads)
+        self.q_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+        kv_dim = self.n_kv_heads * self.head_dim
+        self.k_proj = nn.Linear(cfg.n_embd, kv_dim, bias=cfg.bias)
+        self.v_proj = nn.Linear(cfg.n_embd, kv_dim, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.dropout = cfg.dropout
 
@@ -260,20 +268,36 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("_freqs_cos", cos, persistent=False)
         self.register_buffer("_freqs_sin", sin, persistent=False)
 
+    @staticmethod
+    def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """Repete heads K/V para GQA.
+
+        Args:
+            x: (B, n_kv_heads, T, head_dim)
+            n_rep: Numero de repeticoes.
+
+        Returns:
+            (B, n_head, T, head_dim) onde n_head = n_kv_heads * n_rep
+        """
+        if n_rep == 1:
+            return x
+        B, n_kv, T, hd = x.shape
+        return x[:, :, None, :, :].expand(B, n_kv, n_rep, T, hd).reshape(B, n_kv * n_rep, T, hd)
+
     def forward(self, x: torch.Tensor,
                 kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         B, T, C = x.size()
 
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Aplica RoPE nas posicoes atuais (antes do cache)
+        # Aplica RoPE nas posicoes atuais
         if self.use_rope:
             self._maybe_init_rope(x.device)
             cos_slice = self._freqs_cos[:, :, :T, :]
             sin_slice = self._freqs_sin[:, :, :T, :]
+            # RoPE precisa de shapes (B, n_head, T, head_dim) e (B, n_kv_heads, T, head_dim)
             q, k = apply_rotary_emb(q, k, cos_slice, sin_slice)
 
         # Com KV Cache
@@ -281,6 +305,10 @@ class CausalSelfAttention(nn.Module):
             k_prev, v_prev = kv_cache
             k = torch.cat([k_prev, k], dim=2)
             v = torch.cat([v_prev, v], dim=2)
+
+        # Expande K/V para o numero de Q heads (GQA)
+        k = self._repeat_kv(k, self.n_rep)
+        v = self._repeat_kv(v, self.n_rep)
 
         T_full = k.size(2)
 
@@ -519,6 +547,7 @@ def tiny_config(vocab_size: int = 512, block_size: int = 256) -> NINEConfig:
         block_size=block_size,
         n_layer=6,
         n_head=6,
+        n_kv_heads=4,  # GQA: 6 Q heads, 4 KV heads
         n_embd=384,
         dropout=0.0,
         bias=False,
@@ -533,6 +562,7 @@ def small_config(vocab_size: int = 4096, block_size: int = 512) -> NINEConfig:
         block_size=block_size,
         n_layer=10,
         n_head=8,
+        n_kv_heads=4,  # GQA: 8 Q heads, 4 KV heads
         n_embd=512,
         dropout=0.0,
         bias=False,
@@ -547,6 +577,7 @@ def medium_config(vocab_size: int = 8192, block_size: int = 1024) -> NINEConfig:
         block_size=block_size,
         n_layer=16,
         n_head=12,
+        n_kv_heads=4,  # GQA: 12 Q heads, 4 KV heads
         n_embd=768,
         dropout=0.1,
         bias=False,

@@ -91,7 +91,54 @@ def load_fused_model(
               f"layers={cfg.n_layer}, heads={cfg.n_head}")
 
     model = NINE1(cfg)
-    model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
+
+    # Compatibilidade retroativa: checkpoints pre-GQA usavam c_attn (QKV juntos)
+    # Agora temos q_proj, k_proj, v_proj separados para suporte a GQA
+    raw_state = ckpt["model"] if "model" in ckpt else ckpt
+    has_old_c_attn = any(k.endswith(".c_attn.weight") for k in raw_state.keys())
+    if has_old_c_attn:
+        # Calcula dimensao K/V target (GQA pode ter n_kv_heads < n_head)
+        head_dim = cfg.n_embd // cfg.n_head
+        n_kv = cfg.n_kv_heads if cfg.n_kv_heads > 0 else cfg.n_head
+        kv_target_dim = n_kv * head_dim
+        is_gqa = n_kv < cfg.n_head
+
+        if verbose or is_gqa:
+            print("[fuse] Detectado checkpoint pre-GQA (c_attn). Convertendo...")
+            if is_gqa:
+                print(f"[fuse]   Aviso: n_kv_heads={n_kv} < n_head={cfg.n_head}. "
+                      f"K/V serao truncados para {kv_target_dim} dims.", file=sys.stderr)
+
+        new_state = {}
+        for name, tensor in raw_state.items():
+            if name.endswith(".c_attn.weight"):
+                block = name.replace(".c_attn.weight", "")
+                q, k, v = tensor.chunk(3, dim=0)
+                # Trunca K/V para GQA se necessario
+                if is_gqa and k.size(0) > kv_target_dim:
+                    k = k[:kv_target_dim]
+                    v = v[:kv_target_dim]
+                new_state[f"{block}.q_proj.weight"] = q
+                new_state[f"{block}.k_proj.weight"] = k
+                new_state[f"{block}.v_proj.weight"] = v
+            elif name.endswith(".c_attn.bias"):
+                block = name.replace(".c_attn.bias", "")
+                q, k, v = tensor.chunk(3, dim=0)
+                if is_gqa and k.size(0) > kv_target_dim:
+                    k = k[:kv_target_dim]
+                    v = v[:kv_target_dim]
+                new_state[f"{block}.q_proj.bias"] = q
+                new_state[f"{block}.k_proj.bias"] = k
+                new_state[f"{block}.v_proj.bias"] = v
+            else:
+                new_state[name] = tensor
+        raw_state = new_state
+
+    load_result = model.load_state_dict(raw_state, strict=False)
+    if load_result.missing_keys:
+        print(f"[fuse] AVISO: {len(load_result.missing_keys)} parametros faltando (ok se for LoRA)", file=sys.stderr)
+    if load_result.unexpected_keys:
+        print(f"[fuse] AVISO: {len(load_result.unexpected_keys)} parametros inesperados", file=sys.stderr)
 
     # Validacao pos-carga
     if validate:
