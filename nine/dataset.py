@@ -46,8 +46,6 @@ class TextDataset:
     """
 
     def __init__(self, data, block_size: int, vocab_size: Optional[int] = None):
-        from torch.utils.data import Dataset  # lazy
-
         if block_size < MIN_CHUNK_SIZE:
             raise ValueError(f"block_size {block_size} muito pequeno (min {MIN_CHUNK_SIZE})")
 

@@ -36,10 +36,11 @@ MAX_DECODE_IDS = 100_000      # Limite de seguranca para decode
 # Regex GPT-2 style para PT-BR (compativel com re padrao do Python).
 # Usa ranges Unicode explicitos sem \\p{L} (nao suportado por re).
 # Cobre: Latin-1 Supplement (\\xC0-\\xFF) e Latin Extended-A (\\u0100-\\u017F)
-PAT = r"""'(?:[sdmt]|ll|ve|re)| ?[A-Za-z\xC0-\xFF\u0100-\u017F]+| ?\d+| ?[^\w\s]+|\s+(?!\S)|\s+"""
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?[A-Za-z_\xC0-\xFF\u0100-\u017F]+| ?\d+| ?[^\w\s]+|\s+(?!\S)|\s+"""
 
 # Pattern alternativo com Unicode properties (usado se regex lib estiver disponivel)
-PAT_UNICODE = r""""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|//[^\n]*|#[^\n]*|'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\d+| ?[^\w\s]+|\s+(?!\S)|\s+"""
+# NOTA: \p{L} NAO inclui underscore, entao adicionamos _ explicitamente
+PAT_UNICODE = r""""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|//[^\n]*|#[^\n]*|'(?:[sdmt]|ll|ve|re)| ?[\p{L}_]+| ?\d+| ?[^\s\w]+|\s+(?!\S)|\s+"""
 
 
 def _bytes_to_unicode():
