@@ -96,7 +96,7 @@ def _run_model_tests(has_torch: bool):
 
     import torch
     from nine.model import NINE1, tiny_config, small_config, validate_checkpoint_state
-    from nine.data import TextDataset
+    from nine.dataset import TextDataset
 
     # ---- Model forward ----
     cfg = tiny_config(vocab_size=512, block_size=128)

@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from .model import NINE1, NINEConfig
-from .data import get_batch
+from .dataset import get_batch
 
 
 # Limites de seguranca

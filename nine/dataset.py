@@ -12,28 +12,47 @@ from __future__ import annotations
 import os
 from typing import Optional, Union
 
-import numpy as np
-import torch
-from torch.utils.data import Dataset
+# Imports lazy: numpy e torch sao importados apenas quando usados
+# (evita ModuleNotFoundError ao importar nine.data.seed sem torch/numpy)
+_np = None
+_torch = None
 
 
-# Limites de seguranca
+def _get_np():
+    global _np
+    if _np is None:
+        import numpy as np
+        _np = np
+    return _np
+
+
+def _get_torch():
+    global _torch
+    if _torch is None:
+        import torch as _t
+        _torch = _t
+    return _torch
+
+
+# Constantes
 MAX_DATASET_SIZE = 10_000_000_000  # 10B tokens max
 MIN_CHUNK_SIZE = 16                # block_size minimo
 
 
-class TextDataset(Dataset):
+class TextDataset:
     """
     Dataset sequencial deterministico sobre memmap .bin.
     Cada index retorna um chunk de block_size+1 tokens consecutivos.
     """
 
-    def __init__(self, data: Union[np.memmap, np.ndarray, str],
-                 block_size: int, vocab_size: Optional[int] = None):
+    def __init__(self, data, block_size: int, vocab_size: Optional[int] = None):
+        from torch.utils.data import Dataset  # lazy
+
         if block_size < MIN_CHUNK_SIZE:
             raise ValueError(f"block_size {block_size} muito pequeno (min {MIN_CHUNK_SIZE})")
 
         self.block_size = block_size
+        np = _get_np()
 
         if isinstance(data, str):
             if not os.path.exists(data):
@@ -67,16 +86,17 @@ class TextDataset(Dataset):
 
     def __getitem__(self, idx):
         i = idx % self.length
-        # Validacao de indice
         if i < 0 or i + self.block_size + 1 > len(self.data):
             i = 0
+        np = _get_np()
+        torch = _get_torch()
         chunk = np.array(self.data[i: i + self.block_size + 1], dtype=np.int64)
         x = torch.from_numpy(chunk[:-1])
         y = torch.from_numpy(chunk[1:])
         return x, y
 
 
-def get_batch(data: np.memmap, block_size: int, batch_size: int, device: str = "cpu"):
+def get_batch(data, block_size: int, batch_size: int, device: str = "cpu"):
     """Amostra um batch aleatorio do dataset binario.
 
     Args:
@@ -88,6 +108,8 @@ def get_batch(data: np.memmap, block_size: int, batch_size: int, device: str = "
     Returns:
         (x, y): Tensores (batch_size, block_size).
     """
+    np = _get_np()
+    torch = _get_torch()
     n = len(data)
     max_start = n - block_size - 1
     if max_start < 1:
