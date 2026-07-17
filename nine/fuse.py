@@ -17,11 +17,18 @@ import os
 import sys
 from typing import Optional, Tuple
 
-import torch
+_torch = None
 
-from .model import NINE1, NINEConfig, validate_checkpoint_state, safe_load_checkpoint
+
+def _get_torch():
+    global _torch
+    if _torch is None:
+        import torch as _t
+        _torch = _t
+    return _torch
+
+
 from .tokenizer import BPETokenizer
-from .finetune import add_lora
 
 
 # Caminhos padrao permitidos
@@ -37,7 +44,7 @@ def load_fused_model(
     lora_alpha: int = 16,
     verbose: bool = False,
     validate: bool = True,
-) -> Tuple[NINE1, Optional[BPETokenizer]]:
+):
     """Carrega o modelo base + LoRA opcional + tokenizer BPE.
 
     Carrega com validacao de seguranca de checkpoint.
@@ -59,6 +66,11 @@ def load_fused_model(
         FileNotFoundError: Se base_path nao existe.
         RuntimeError: Se checkpoint estiver corrompido.
     """
+    # Imports lazy (torch pode nao estar instalado)
+    from .model import NINE1, NINEConfig, validate_checkpoint_state, safe_load_checkpoint
+    from .finetune import add_lora
+    torch = _get_torch()
+
     if not os.path.exists(base_path):
         raise FileNotFoundError(f"Checkpoint base nao encontrado: {base_path}")
 

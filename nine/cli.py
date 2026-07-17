@@ -36,7 +36,6 @@ def _get_torch():
     return _torch
 
 from .tokenizer import BPETokenizer, BOS_TOKEN, EOS_TOKEN, sanitize_filename_component
-from .fuse import load_fused_model
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +327,9 @@ def main():
     # Valores seguros
     args.tokens = min(args.tokens, MAX_GENERATION_TOKENS)
     args.temp = max(args.temp, 0.1)  # Evita temperatura muito baixa (determinismo extremo)
+
+    # Import lazy (torch pode nao estar instalado)
+    from .fuse import load_fused_model
 
     model, tok_bpe = load_fused_model(
         base_path=args.ckpt,
